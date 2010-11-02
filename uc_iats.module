@@ -1,0 +1,218 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Defines the IATS payment gateway.
+ */
+
+/**
+ * Implementation of hook_payment_gateway().
+ */
+function uc_iats_payment_gateway() {
+  
+  $gateways[] = array(
+    'id' => 'iats',
+    'title' => t('IATS'),
+    'description' => t('Process credit card payments using IATS.'),
+    'settings' => 'uc_iats_settings_form',
+    'credit' => 'uc_iats_charge',
+    'credit_txn_types' => array(UC_CREDIT_AUTH_CAPTURE),
+  );
+
+  return $gateways;
+}
+
+/**
+ * Admin settings form.
+ */
+function uc_iats_settings_form() {
+
+  $form['uc_iats_credentials'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('IATS API Credentials'),
+  );
+  $form['uc_iats_credentials']['uc_iats_agentcode'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Agent Code'),
+    '#description' => t('Your IATS account Agent Code.'),
+    '#default_value' => variable_get('uc_iats_agentcode', ''),
+  );
+  $form['uc_iats_credentials']['uc_iats_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Password'),
+    '#description' => t('Your IATS account password.'),
+    '#default_value' => variable_get('uc_iats_password', ''),
+  );
+  $form['uc_iats_library'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('IATSLink Library'),
+  );
+  $form['uc_iats_library']['uc_iats_iatslink_library_location'] = array(
+    '#type' => 'textfield',
+    '#title' => t('IATSLink Location'),
+    '#description' => t('The location of the IATSLink library (relative to the uc_iats module directory). Do not include leading or trailing slashes.'),
+    '#default_value' => variable_get('uc_iats_iatslink_library_location', 'iatslink'),
+  );
+  
+  return $form;
+}
+
+/**
+ * Handles credit card transaction.
+ */
+function uc_iats_charge($order_id, $amount, $data) {
+  // Load the order.
+  $order = uc_order_load($order_id);
+  
+  /**
+   * TODO: Add switch statement to do other stuff here.
+   * This space is reserved for future development, including recurring
+   * payments, etc.
+   */
+   
+  // Pass the info along. 
+  return _uc_iats_charge($order, $amount, $data);
+}
+
+/**
+ * Handles authorizations and captures.
+ * Does the heavy lifting.
+ */
+function _uc_iats_charge($order, $amount, $data) {
+  
+  // Build a description of the order for logging in Auth.Net.
+  $description = array();
+  foreach ((array) $order->products as $product) {
+    $description[] = $product->qty .'x '. $product->model;
+  }
+
+  $billing_country = uc_get_country_data(array('country_id' => $order->billing_country));
+
+  $context = array(
+    'revision' => 'formatted-original',
+    'type' => 'amount',
+  );
+  $options = array(
+    'sign' => FALSE,
+    'thou' => FALSE,
+    'dec' => '.',
+  );
+  
+  // Including the IATS library.
+  $iatslink_location = variable_get('uc_iats_iatslink_library_location', 'iatslink');
+  module_load_include('php', 'uc_iats', $iatslink_location . '/iatslink');
+  
+  // Instantiating our object.
+  $iats = new iatslink();
+  
+  // Some initialization settings.
+  $iats->setAgentCode(variable_get('uc_iats_agentcode', ''));
+  $iats->setPassword(variable_get('uc_iats_password', ''));
+  $iats->setTestMode(variable_get('uc_iats_testmode', 'TRUE'));
+  
+  // Setting credit card information.
+  $iats->setCardNumber($order->payment_details['cc_number']);
+  $month = str_pad($order->payment_details['cc_exp_month'],2,0,STR_PAD_LEFT);
+  $year = substr($order->payment_details['cc_exp_year'],2,2);
+  $iats->setCardExpiry($month .'/'. $year);
+  $iats->setCVV2($order->payment_details['cc_cvv']);
+  
+  // Only for people in the US.
+  $iats->setFirstName($order->billing_first_name);
+  $iats->setLastName($order->billing_last_name);
+  $iats->setStreetAddress($order->billing_street1);
+  $iats->setCity($order->billing_city);
+  $iats->setState(uc_get_zone_code($order->billing_zone));
+  $iats->setZipCode($order->billing_postal_code);
+  
+  // Setting order information.
+  $iats->setDollarAmount(uc_price($amount, $context, $options));
+  $iats->setComment(implode(', ', $description));
+  $iats->setInvoiceNumber($order->order_id);
+
+  // Process the card.
+  $iats->processCreditCard();
+  // Check the response from IATS for success or failure.
+  if ($iats->getStatus() == 1) {
+    $response = $iats->getAuthorizationResult();
+    $response = explode(':', $response, 2);
+    $trxn_result = trim($response[0]);
+    $trxn_id = trim($response[1]);
+    
+    /**
+     * Deal with responses.
+     */
+     
+    // Payment accepted.
+    if ($trxn_result == 'OK') {
+      $result = _uc_iats_build_result(TRUE);
+      
+      // Build an admin order comment.
+      $context = array(
+        'revision' => 'formatted-original',
+        'type' => 'amount',
+      );
+      $comment = t('<b>@status:</b> @message',
+        array('@status' => $result['success'] ? t('ACCEPTED') : t('REJECTED'), '@message' => $response[1]));
+
+      // Save the comment to the order.
+      uc_order_comment_save($order->order_id, $result['user'], $comment, 'admin');
+      
+    }
+    
+    // This means the call was successful, but the card was rejected, etc.
+    else {
+      $result = _uc_iats_build_result(FALSE, _uc_iats_handle_error($trxn_id));
+    }
+  
+  // Could not call the API.
+  } else {
+    $result = _uc_iats_build_result(FALSE, $iats->getError());
+  }
+
+  return $result;
+}
+
+function _uc_iats_build_result($success = FALSE, $message = '') {
+  global $user;
+  return array(
+    'success' => $success,
+    'message' => $message,
+    'user' => $user->uid,
+  );
+}
+
+function _uc_iats_handle_error($code) {
+  $errors = array(
+    1 => 'Agent Code has not been set up on the authorization system.',
+    2 => 'Unable to process transaction. Verify and re-enter credit card information.',
+    3 => 'Charge card expired.',
+    4 => 'Incorrect expiration date.',
+    5 => 'Invalid transaction. Verify and re-enter credit card information.',
+    6 => 'Transaction not supported by institution.',
+    7 => 'Lost or stolen card.',
+    8 => 'Invalid card status.',
+    9 => 'Restricted card status. Usually on corporate cards restricted to specific sales.',
+    10 => 'Error. Please verify and re-enter credit card information.',
+    11 => 'General decline code, may have different reasons for each card type. Please have your client call customer service.',
+    14 => 'This means that the credit card is over the limit.',
+    15 => 'Decline code, may have different reasons for each card type. Please have your client call customer service.',
+    16 => 'Invalid charge card number. Verify and re-enter credit card information.',
+    17 => 'Unable to authorize transaction. Verify card information with customer and re-enter. Could be invalid name or expiry date.',
+    18 => 'Card not supported by institution.',
+    19 => 'Incorrect CVV2.',
+    22 => 'Bank Timeout. Bank lines may be down or busy. Re-try transaction later.',
+    23 => 'System error. Re-try transaction later.',
+    24 => 'Charge card expired.',
+    25 => 'Capture card. Reported lost or stolen.',
+    27 => 'System error, please re-enter transaction.',
+    29 => 'Rejected by Ticketmaster.',
+    31 => 'Manual reject code ',
+    39 => 'Contact Ticketmaster 1-888-955-5455 ',
+    40 => 'Card not supported by Ticketmaster. Invalid cc number.',
+    41 => 'Invalid Expiry date ',
+    100 => 'Authorization system down. DO NOT REPROCESS.',
+  );
+  return $errors[$code];
+}

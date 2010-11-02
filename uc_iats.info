@@ -1,0 +1,7 @@
+; $Id$
+name = IATS
+description = Process payments using the IATS gateway. This module currently only supports one-time payments.
+dependencies[] = uc_payment
+dependencies[] = uc_credit
+package = Ubercart - payment
+core = 6.x

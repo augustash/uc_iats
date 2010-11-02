@@ -1,0 +1,9 @@
+<?php
+// $Id$
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function uc_iats_uninstall() {
+  db_query('DELETE FROM {variable} WHERE name LIKE "uc_iats_%%"');
+}
